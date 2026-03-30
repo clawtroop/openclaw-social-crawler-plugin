@@ -1,0 +1,23 @@
+{
+  "plugins": {
+    "allow": ["social-crawler-agent"],
+    "entries": {
+      "social-crawler-agent": {
+        "enabled": true,
+        "source": {
+          "type": "local",
+          "path": "D:/kaifa/clawtroop/openclaw-social-crawler-plugin"
+        },
+        "config": {
+          "crawlerRoot": "D:/kaifa/clawtroop/social-data-crawler",
+          "pythonBin": "python",
+          "platformBaseUrl": "http://101.47.73.95",
+          "platformToken": "",
+          "minerId": "miner-001",
+          "outputRoot": "D:/kaifa/clawtroop/social-data-crawler/output/agent-runs",
+          "defaultBackend": "http"
+        }
+      }
+    }
+  }
+}

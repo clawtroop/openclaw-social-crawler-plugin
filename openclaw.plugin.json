@@ -1,0 +1,40 @@
+{
+  "id": "social-crawler-agent",
+  "name": "Social Crawler Agent",
+  "description": "OpenClaw tool plugin that drives the social-data-crawler skill and reports Mining task results.",
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {
+      "crawlerRoot": {
+        "type": "string",
+        "description": "Absolute path to the social-data-crawler project root."
+      },
+      "pythonBin": {
+        "type": "string",
+        "description": "Python executable used to run the plugin helper scripts."
+      },
+      "platformBaseUrl": {
+        "type": "string",
+        "description": "Platform Service base URL."
+      },
+      "platformToken": {
+        "type": "string",
+        "description": "Optional bearer token for Platform Service. Leave empty for auth-disabled deployments."
+      },
+      "minerId": {
+        "type": "string",
+        "description": "Miner identifier used for claim and heartbeat calls."
+      },
+      "outputRoot": {
+        "type": "string",
+        "description": "Directory where plugin-triggered crawler runs are stored."
+      },
+      "defaultBackend": {
+        "type": "string",
+        "description": "Optional backend override passed to social-data-crawler."
+      }
+    },
+    "required": ["crawlerRoot", "platformBaseUrl", "minerId"]
+  }
+}

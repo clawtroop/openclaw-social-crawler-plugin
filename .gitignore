@@ -1,0 +1,17 @@
+# 依赖与构建
+node_modules/
+dist/
+*.tsbuildinfo
+
+# 环境
+.env
+.env.*
+
+# Python 缓存（脚本目录）
+**/__pycache__/
+*.py[cod]
+
+# 日志与临时
+*.log
+.DS_Store
+Thumbs.db
