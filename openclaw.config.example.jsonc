@@ -14,8 +14,13 @@
           "platformBaseUrl": "http://101.47.73.95",
           "platformToken": "",
           "minerId": "miner-001",
+          "awpWalletBin": "awp-wallet",
+          "awpWalletTokenRef": {
+            "source": "env",
+            "provider": "processenv",
+            "id": "AWP_WALLET_TOKEN"
+          },
           "outputRoot": "D:/kaifa/clawtroop/social-data-crawler/output/agent-runs",
-          "defaultBackend": "http",
           "workerStateRoot": "D:/kaifa/clawtroop/social-data-crawler/output/agent-runs/_worker_state",
           "workerMaxParallel": 3,
           "datasetRefreshSeconds": 900,

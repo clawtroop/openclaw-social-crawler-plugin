@@ -113,6 +113,26 @@ Additional worker-oriented config:
 - `discoveryMaxPages`
 - `discoveryMaxDepth`
 - `authRetryIntervalSeconds`
+- `awpWalletBin`
+- `awpWalletToken`
+- `awpWalletTokenRef`
+
+## Production deployment note
+
+Do not ship machine-specific wallet paths such as `C:\\nvm4w\\nodejs\\awp-wallet.cmd` in plugin defaults or shared config.
+
+For production or multi-machine deployment:
+
+- install `awp-wallet` on the target host so it is available on `PATH`
+- keep plugin config portable by setting `awpWalletBin` to `awp-wallet`
+- generate a session token on the target host with `awp-wallet unlock --duration 3600`
+- inject that token through deployment config or secrets management into `awpWalletTokenRef`
+- `awpWalletTokenRef` supports the same OpenClaw SecretRef pattern used elsewhere in the plugin: `env`, `file`, and `exec`
+
+The plugin implements the request signing bridge, but the private key stays in `awp-wallet`. The plugin only calls the CLI to:
+
+- read the signer address with `awp-wallet receive`
+- sign EIP-712 typed data with `awp-wallet sign-typed-data`
 
 Optional process env overrides for local Gateway enrich:
 
@@ -124,7 +144,24 @@ Optional process env overrides for local Gateway enrich:
 ## Local verification
 
 ```bash
+awp-wallet receive || awp-wallet init
+awp-wallet unlock --duration 3600
 python scripts/run_tool.py --help
 python scripts/run_tool.py run-worker 60 1
 python scripts/run_tool.py run-loop 60 1
+```
+
+Example token injection via environment-backed SecretRef:
+
+```json
+{
+  "config": {
+    "awpWalletBin": "awp-wallet",
+    "awpWalletTokenRef": {
+      "source": "env",
+      "provider": "processenv",
+      "id": "AWP_WALLET_TOKEN"
+    }
+  }
+}
 ```

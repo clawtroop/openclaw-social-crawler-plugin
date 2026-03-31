@@ -36,11 +36,28 @@
       },
       "awpWalletBin": {
         "type": "string",
-        "description": "Path to awp-wallet CLI executable. Defaults to 'awp-wallet'."
+        "description": "Path or command name for awp-wallet CLI. Production deployments should normally leave this as 'awp-wallet' and install the CLI on PATH."
       },
       "awpWalletToken": {
         "type": "string",
-        "description": "awp-wallet session token (from 'awp-wallet unlock --scope full'). Required for EIP-712 signed requests."
+        "description": "awp-wallet session token (from 'awp-wallet unlock --duration 3600'). Required for EIP-712 signed requests."
+      },
+      "awpWalletTokenRef": {
+        "type": "object",
+        "description": "Optional OpenClaw SecretRef for resolving the awp-wallet session token from env/file/exec providers at runtime.",
+        "additionalProperties": false,
+        "properties": {
+          "source": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          }
+        },
+        "required": ["source", "provider", "id"]
       },
       "workerStateRoot": {
         "type": "string",

@@ -88,7 +88,14 @@ class WalletSigner:
             env["HOME"] = env["USERPROFILE"]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         if result.returncode != 0:
-            raise RuntimeError(f"awp-wallet failed (exit {result.returncode}): {result.stderr.strip()}")
+            stderr = result.stderr.strip()
+            if "Invalid or expired session token" in stderr:
+                raise RuntimeError(
+                    "awpWalletToken expired or invalid; rerun "
+                    "`awp-wallet unlock --duration 3600` and update plugin config before retrying. "
+                    f"awp-wallet stderr: {stderr}"
+                )
+            raise RuntimeError(f"awp-wallet failed (exit {result.returncode}): {stderr}")
         return json.loads(result.stdout)
 
     def get_address(self) -> str:

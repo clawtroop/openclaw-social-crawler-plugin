@@ -727,8 +727,9 @@ def _export_and_submit_core_submissions_for_task(
     submission_id = _extract_submission_id(report_result)
     if submission_id:
         response_data = _resolve_existing_submission_response(client, submission_id=submission_id, report_result=report_result)
-        response_path.write_text(json.dumps(response_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        return export_path, response_path
+        if response_data is not None:
+            response_path.write_text(json.dumps(response_data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return export_path, response_path
     response = client.submit_core_submissions(payload)
     response_path.write_text(json.dumps(response, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return export_path, response_path
@@ -811,7 +812,7 @@ def _resolve_existing_submission_response(
     *,
     submission_id: str,
     report_result: dict[str, Any] | None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     fetch_core_submission = getattr(client, "fetch_core_submission", None)
     if callable(fetch_core_submission):
         try:
@@ -819,6 +820,7 @@ def _resolve_existing_submission_response(
         except httpx.HTTPStatusError as error:
             if error.response.status_code != 404:
                 raise
+            return None
         else:
             return {"data": [submission]}
     if isinstance(report_result, dict):

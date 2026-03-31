@@ -4,6 +4,11 @@ import { Type } from "@sinclair/typebox";
 import type { OpenClawPluginApi } from "../api.js";
 
 type PluginConfig = {
+  secretRef?: {
+    source?: string;
+    provider?: string;
+    id?: string;
+  };
   crawlerRoot?: string;
   pythonBin?: string;
   platformBaseUrl?: string;
@@ -13,6 +18,11 @@ type PluginConfig = {
   defaultBackend?: string;
   awpWalletBin?: string;
   awpWalletToken?: string;
+  awpWalletTokenRef?: {
+    source?: string;
+    provider?: string;
+    id?: string;
+  };
   workerStateRoot?: string;
   workerMaxParallel?: number;
   datasetRefreshSeconds?: number;
@@ -58,6 +68,7 @@ async function runPythonTool(
     DEFAULT_BACKEND: cfg.defaultBackend ?? "",
     AWP_WALLET_BIN: cfg.awpWalletBin ?? "awp-wallet",
     AWP_WALLET_TOKEN: cfg.awpWalletToken ?? "",
+    AWP_WALLET_TOKEN_SECRET_REF: cfg.awpWalletTokenRef ? JSON.stringify(cfg.awpWalletTokenRef) : "",
     PLUGIN_PYTHON_BIN: pythonBin,
     WORKER_STATE_ROOT: cfg.workerStateRoot ?? path.join(cfg.crawlerRoot, "output", "agent-runs", "_worker_state"),
     WORKER_MAX_PARALLEL: String(cfg.workerMaxParallel ?? 3),
