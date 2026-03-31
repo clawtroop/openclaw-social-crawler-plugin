@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 from task_sources import (
+    BackendClaimSource,
     DatasetDiscoverySource,
     build_follow_up_items_from_discovery,
     claimed_task_from_payload,
     claimed_task_to_work_item,
     infer_platform_task,
+    local_task_from_payload,
+    task_to_work_item,
 )
 from worker_state import WorkerStateStore
 
@@ -24,6 +27,17 @@ class FakeClient:
                 "source_domains": ["en.wikipedia.org", "www.linkedin.com"],
             }
         ]
+
+
+class BrokenClaimClient(FakeClient):
+    def claim_repeat_crawl_task(self) -> dict:
+        return {"id": "repeat-1", "submission_id": "sub-missing"}
+
+    def claim_refresh_task(self) -> dict:
+        return {"id": "refresh-1", "dataset_id": "dataset-1", "url": "https://arxiv.org/abs/2401.12345"}
+
+    def fetch_core_submission(self, submission_id: str) -> dict:
+        raise RuntimeError(f"submission not found: {submission_id}")
 
 
 def test_claimed_repeat_task_enriches_url_from_submission() -> None:
@@ -81,9 +95,42 @@ def test_build_follow_up_items_from_discovery_uses_canonical_urls() -> None:
     assert [item.platform for item in followups] == ["wikipedia", "linkedin"]
 
 
+def test_claimed_and_local_tasks_normalize_parity() -> None:
+    claimed = claimed_task_from_payload(
+        "refresh",
+        {"id": "task-4", "dataset_id": "dataset-1", "url": "https://arxiv.org/abs/2401.12345"},
+        client=FakeClient(),
+    )
+    claimed_item = task_to_work_item(claimed)
+    local = local_task_from_payload(
+        {
+            "task_id": "local-1",
+            "task_type": "local_refresh",
+            "url": "https://arxiv.org/abs/2401.12345",
+            "dataset_id": "dataset-1",
+        }
+    )
+    local_item = task_to_work_item(local)
+
+    assert claimed_item.dataset_id == local_item.dataset_id
+    assert claimed_item.platform == local_item.platform
+    assert claimed_item.resource_type == local_item.resource_type
+    assert claimed_item.url == local_item.url
+
+
 def test_infer_platform_task_falls_back_to_generic() -> None:
     platform, resource_type, fields = infer_platform_task("https://example.com/path")
 
     assert platform == "generic"
     assert resource_type == "page"
     assert fields["url"] == "https://example.com/path"
+
+
+def test_backend_claim_source_isolates_broken_repeat_task() -> None:
+    source = BackendClaimSource(BrokenClaimClient())
+
+    items = source.collect()
+
+    assert len(items) == 1
+    assert items[0].claim_task_type == "refresh"
+    assert any("repeat_crawl task repeat-1 skipped" in error for error in source.last_errors)

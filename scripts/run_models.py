@@ -6,8 +6,9 @@ from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
-class ClaimedTask:
+class TaskEnvelope:
     task_id: str
+    task_source: str
     task_type: str
     url: str
     dataset_id: str | None

@@ -7,6 +7,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urljoin
 
 import httpx
 
@@ -16,6 +17,8 @@ if TYPE_CHECKING:
 from auth_orchestrator import AUTH_ERROR_CODES, AuthOrchestrator
 from common import inject_crawler_root, resolve_wallet_config
 from crawl_mode_planner import CrawlModePlanner
+from pow_solver import UnsupportedChallenge, solve_challenge
+from run_artifacts import RunArtifactWriter
 from run_models import CrawlerRunResult, WorkItem, WorkerConfig, WorkerIterationSummary
 from task_sources import (
     BackendClaimSource,
@@ -23,7 +26,10 @@ from task_sources import (
     ResumeQueueSource,
     build_follow_up_items_from_discovery,
     build_report_payload,
+    claimed_task_from_payload,
+    local_task_from_payload,
     optional_string,
+    task_to_work_item,
 )
 from worker_state import WorkerStateStore
 
@@ -150,7 +156,14 @@ class PlatformClient:
         if payload is not None:
             kwargs["json"] = payload
         if self._signer is not None:
-            kwargs["headers"] = self._signer.build_auth_headers(method, path)
+            base_url = str(self._client.base_url)
+            request_url = urljoin(base_url if base_url.endswith("/") else f"{base_url}/", path.lstrip("/"))
+            kwargs["headers"] = self._signer.build_auth_headers(
+                method,
+                request_url,
+                payload,
+                content_type="application/json",
+            )
         last_error: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -180,7 +193,7 @@ class CrawlerRunner:
         self.default_backend = config.default_backend
 
     def run_item(self, item: WorkItem, command: str) -> CrawlerRunResult:
-        output_dir = Path(item.output_dir) if item.output_dir else (self.output_root / item.source / _safe_path_segment(item.item_id))
+        output_dir = resolve_item_output_dir(item, output_root=self.output_root)
         output_dir.mkdir(parents=True, exist_ok=True)
         input_path = output_dir / "task-input.jsonl"
         input_path.write_text(json.dumps(item.record, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -227,6 +240,22 @@ def _solve_pow_challenge(challenge: dict[str, Any]) -> str:
     return str(challenge.get("prompt", ""))
 
 
+def _build_test_config(root: Path) -> WorkerConfig:
+    return WorkerConfig(
+        base_url="http://example.test",
+        token="",
+        miner_id="miner-test",
+        output_root=root / "outputs",
+        crawler_root=CRAWLER_ROOT,
+        python_bin="python",
+        state_root=root / "state",
+    )
+
+
+def resolve_item_output_dir(item: WorkItem, *, output_root: Path) -> Path:
+    return Path(item.output_dir) if item.output_dir else (output_root / item.source / _safe_path_segment(item.item_id))
+
+
 class AgentWorker:
     def __init__(self, *, client: PlatformClient, runner: CrawlerRunner, config: WorkerConfig) -> None:
         self.client = client
@@ -244,6 +273,8 @@ class AgentWorker:
 
     def run_once(self) -> str:
         summary = self.run_iteration(1)
+        if summary["errors"]:
+            return "; ".join(summary["errors"])
         if summary["messages"]:
             return "; ".join(summary["messages"])
         if summary["auth_pending"]:
@@ -252,9 +283,7 @@ class AgentWorker:
         return "no task available"
 
     def process_task_payload(self, task_type: str, payload: dict[str, Any]) -> str:
-        from task_sources import claimed_task_from_payload, claimed_task_to_work_item
-
-        item = claimed_task_to_work_item(claimed_task_from_payload(task_type, payload, client=self.client))
+        item = self._work_item_from_payload(task_type, payload)
         summary = WorkerIterationSummary(iteration=1)
         self._process_items([item], summary)
         result = summary.to_dict()
@@ -264,6 +293,11 @@ class AgentWorker:
             return "; ".join(result["errors"])
         return json.dumps(result, ensure_ascii=False)
 
+    def _work_item_from_payload(self, task_type: str, payload: dict[str, Any]) -> WorkItem:
+        if task_type.startswith("local_") or task_type == "local_file":
+            return task_to_work_item(local_task_from_payload({"task_type": task_type, **payload}))
+        return task_to_work_item(claimed_task_from_payload(task_type, payload, client=self.client))
+
     def run_iteration(self, iteration: int) -> dict[str, Any]:
         summary = WorkerIterationSummary(iteration=iteration)
         self._send_heartbeats(summary)
@@ -272,10 +306,14 @@ class AgentWorker:
         if not work_items:
             summary.messages.append("no task available")
             summary.retry_pending = len(self.state_store.load_backlog()) + len(self.state_store.load_auth_pending())
-            return summary.to_dict()
+            payload = summary.to_dict()
+            self._write_iteration_summary(payload)
+            return payload
         self._process_items(work_items, summary)
         summary.retry_pending = len(self.state_store.load_backlog()) + len(self.state_store.load_auth_pending())
-        return summary.to_dict()
+        payload = summary.to_dict()
+        self._write_iteration_summary(payload)
+        return payload
 
     def run_loop(self, *, interval: int = 60, max_iterations: int = 0) -> str:
         """Run continuous mining loop.
@@ -349,10 +387,19 @@ class AgentWorker:
         resumed = self.resume_source.collect(limit=self.config.max_parallel)
         summary.resumed_items = len(resumed)
         items.extend(resumed)
-        claimed = self.backend_source.collect()
+        try:
+            claimed = self.backend_source.collect()
+        except Exception as exc:
+            claimed = []
+            summary.errors.append(f"claim source failed: {exc}")
+        summary.errors.extend(getattr(self.backend_source, "last_errors", []))
         summary.claimed_items = len(claimed)
         items.extend(claimed)
-        discoveries = self.dataset_source.collect(min_interval_seconds=self.config.dataset_refresh_seconds)
+        try:
+            discoveries = self.dataset_source.collect(min_interval_seconds=self.config.dataset_refresh_seconds)
+        except Exception as exc:
+            discoveries = []
+            summary.errors.append(f"dataset discovery failed: {exc}")
         summary.discovery_items = len(discoveries)
         items.extend(discoveries)
         merged: dict[str, WorkItem] = {}
@@ -380,41 +427,28 @@ class AgentWorker:
 
     def _run_item(self, item: WorkItem) -> CrawlerRunResult:
         command = self.crawl_mode_planner.choose_command(item)
-        self._preflight_item(item, command=command)
-        return self.runner.run_item(item, command)
+        writer = self._artifact_writer_for_item(item)
+        self._preflight_item(item, command=command, writer=writer)
+        result = self.runner.run_item(item, command)
+        writer.write_json(
+            "crawler/result.json",
+            {
+                "exit_code": result.exit_code,
+                "argv": result.argv,
+                "records_count": len(result.records),
+                "errors_count": len(result.errors),
+            },
+        )
+        return result
 
-    def _preflight_item(self, item: WorkItem, *, command: str) -> None:
-        if item.dataset_id and command != "discover-crawl":
-            try:
-                occupancy = self.client.check_url_occupancy(item.dataset_id, item.url)
-                if occupancy.get("occupied"):
-                    raise SkipItemError(f"URL already occupied for {item.url}")
-            except SkipItemError:
-                raise
-            except Exception:
-                pass
-
-        epoch_id = optional_string(item.metadata.get("epoch_id"))
-        if item.dataset_id and epoch_id:
-            try:
-                preflight = self.client.submit_preflight(item.dataset_id, epoch_id)
-                preflight_data = preflight.get("data", {})
-                if isinstance(preflight_data, dict) and not preflight_data.get("allowed", True):
-                    reason = preflight_data.get("reason", "unknown")
-                    raise SkipItemError(f"preflight rejected: {reason}")
-                challenge = preflight_data.get("challenge") if isinstance(preflight_data, dict) else None
-                if isinstance(challenge, dict) and challenge:
-                    answer = _solve_pow_challenge(challenge)
-                    challenge_id = optional_string(challenge.get("id")) or optional_string(preflight_data.get("challenge_id")) or ""
-                    if challenge_id and answer:
-                        pow_result = self.client.answer_pow_challenge(challenge_id, answer)
-                        pow_data = pow_result.get("data", {})
-                        if isinstance(pow_data, dict) and not pow_data.get("passed"):
-                            raise SkipItemError(f"PoW challenge failed for {item.item_id}")
-            except SkipItemError:
-                raise
-            except Exception:
-                pass
+    def _preflight_item(self, item: WorkItem, *, command: str, writer: RunArtifactWriter | None = None) -> None:
+        terminal_state = self._handle_preflight_common(item, writer=writer, command=command)
+        if terminal_state == "occupancy_blocked":
+            raise SkipItemError(f"URL already occupied for {item.url}")
+        if terminal_state == "preflight_rejected":
+            raise SkipItemError(f"preflight rejected for {item.item_id}")
+        if terminal_state == "challenge_received_but_unsolved":
+            raise SkipItemError(f"challenge received but unsolved for {item.item_id}")
 
     def _handle_result(self, item: WorkItem, result: CrawlerRunResult, summary: WorkerIterationSummary) -> None:
         auth_pending = self.auth_orchestrator.handle_errors(item, result.errors)
@@ -497,6 +531,68 @@ class AgentWorker:
             self.state_store.clear_submit_pending(item.item_id)
             summary.submitted_items += 1
 
+    def _process_single_item_for_test(self, item: WorkItem, writer: RunArtifactWriter) -> str:
+        command = self.crawl_mode_planner.choose_command(item)
+        writer.write_json("task/item.json", item.to_dict())
+        terminal_state = self._handle_preflight_common(item, writer=writer, command=command)
+        if terminal_state is not None:
+            return terminal_state
+        result = self.runner.run_item(item, command)
+        writer.write_json(
+            "crawler/result.json",
+            {
+                "exit_code": result.exit_code,
+                "argv": result.argv,
+                "records_count": len(result.records),
+                "errors_count": len(result.errors),
+            },
+        )
+        return "processed"
+
+    def _handle_preflight_common(self, item: WorkItem, writer: RunArtifactWriter | None, *, command: str) -> str | None:
+        if item.dataset_id and command != "discover-crawl":
+            occupancy = self.client.check_url_occupancy(item.dataset_id, item.url)
+            if writer is not None:
+                writer.write_json("occupancy/response.json", occupancy if isinstance(occupancy, dict) else {})
+            if occupancy.get("occupied"):
+                return "occupancy_blocked"
+
+        epoch_id = optional_string(item.metadata.get("epoch_id"))
+        if not item.dataset_id or not epoch_id:
+            return None
+        preflight = self.client.submit_preflight(item.dataset_id, epoch_id)
+        if writer is not None:
+            writer.write_json("preflight/response.json", preflight if isinstance(preflight, dict) else {})
+        preflight_data = preflight.get("data", {}) if isinstance(preflight, dict) else {}
+        if not isinstance(preflight_data, dict):
+            return None
+        if not preflight_data.get("allowed", True):
+            if writer is not None:
+                writer.write_json("preflight/rejection.json", preflight_data)
+            return "preflight_rejected"
+        challenge = preflight_data.get("challenge")
+        if isinstance(challenge, dict) and challenge:
+            if writer is not None:
+                writer.write_json("preflight/challenge.json", challenge)
+            try:
+                answer = solve_challenge(challenge)
+            except UnsupportedChallenge:
+                return "challenge_received_but_unsolved"
+            challenge_id = optional_string(challenge.get("id")) or optional_string(preflight_data.get("challenge_id")) or ""
+            if challenge_id and answer:
+                if writer is not None:
+                    writer.write_json("preflight/answer.json", {"challenge_id": challenge_id, "answer": answer})
+                self.client.answer_pow_challenge(challenge_id, answer)
+        return None
+
+    def _artifact_writer_for_item(self, item: WorkItem) -> RunArtifactWriter:
+        output_dir = resolve_item_output_dir(item, output_root=self.runner.output_root)
+        return RunArtifactWriter(output_dir / "_run_artifacts")
+
+    def _write_iteration_summary(self, payload: dict[str, Any]) -> None:
+        writer = RunArtifactWriter(self.runner.output_root / "_run_once")
+        writer.write_json("last-summary.json", payload)
+
 
 def build_worker_from_env() -> AgentWorker:
     from signer import WalletSigner
@@ -533,6 +629,13 @@ def build_worker_from_env() -> AgentWorker:
     )
     runner = CrawlerRunner(config)
     return AgentWorker(client=client, runner=runner, config=config)
+
+
+def run_single_item_for_test(*, item: WorkItem, client: Any, runner: Any, root: Path) -> dict[str, Any]:
+    writer = RunArtifactWriter(root / "run-artifacts")
+    worker = AgentWorker(client=client, runner=runner, config=_build_test_config(root))
+    terminal_state = worker._process_single_item_for_test(item, writer)
+    return {"terminal_state": terminal_state}
 
 
 def export_core_submissions(input_path: str, output_path: str, dataset_id: str) -> Path:

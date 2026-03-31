@@ -4,7 +4,7 @@ import re
 from typing import Any
 from urllib.parse import unquote, urlparse
 
-from run_models import ClaimedTask, WorkItem
+from run_models import TaskEnvelope, WorkItem
 from worker_state import WorkerStateStore
 
 
@@ -19,7 +19,7 @@ def claimed_task_from_payload(
     payload: dict[str, Any],
     *,
     client: Any | None = None,
-) -> ClaimedTask:
+) -> TaskEnvelope:
     enriched_payload = enrich_task_payload(task_type, payload, client=client)
     task_id = str(payload.get("id") or "").strip()
     if not task_id:
@@ -32,8 +32,9 @@ def claimed_task_from_payload(
     metadata.pop("id", None)
     metadata.pop("url", None)
     metadata.pop("target_url", None)
-    return ClaimedTask(
+    return TaskEnvelope(
         task_id=task_id,
+        task_source="backend_claim",
         task_type=task_type,
         url=url,
         dataset_id=optional_string(enriched_payload.get("dataset_id")),
@@ -112,23 +113,58 @@ def build_platform_record(url: str, *, platform: str | None = None, resource_typ
     return record
 
 
-def claimed_task_to_work_item(task: ClaimedTask) -> WorkItem:
+def local_task_from_payload(payload: dict[str, Any]) -> TaskEnvelope:
+    metadata = dict(payload)
+    url = str(metadata.pop("url", "") or "").strip()
+    if not url:
+        raise ValueError("local task payload is missing url")
+    task_id_value = metadata.pop("task_id", "")
+    if not task_id_value:
+        task_id_value = metadata.pop("id", "")
+    task_id = str(task_id_value or "").strip()
+    if not task_id:
+        raise ValueError("local task payload is missing task_id")
+    task_type_value = str(metadata.pop("task_type", "") or "local_file")
+    dataset_id = optional_string(metadata.pop("dataset_id", None))
+    platform_override = optional_string(metadata.pop("platform", None))
+    resource_override = optional_string(metadata.pop("resource_type", None))
+    inferred_platform, inferred_resource, _ = infer_platform_task(url)
+    return TaskEnvelope(
+        task_id=task_id,
+        task_source="local_file",
+        task_type=task_type_value,
+        url=url,
+        dataset_id=dataset_id,
+        platform=platform_override or inferred_platform,
+        resource_type=resource_override or inferred_resource,
+        metadata=metadata,
+    )
+
+
+def task_to_work_item(task: TaskEnvelope) -> WorkItem:
     record = build_platform_record(task.url, platform=task.platform, resource_type=task.resource_type)
     for key, value in task.metadata.items():
-        if key not in {"dataset_id", "platform", "resource_type"} and value not in (None, ""):
-            record[key] = value
+        if key in {"dataset_id", "platform", "resource_type"} or value in (None, ""):
+            continue
+        record[key] = value
+    claim_task_id = task.task_id if task.task_source == "backend_claim" else None
+    claim_task_type = task.task_type if task.task_source == "backend_claim" else None
     return WorkItem(
         item_id=f"{task.task_type}:{task.task_id}",
-        source="backend_claim",
+        source=task.task_source,
         url=task.url,
         dataset_id=task.dataset_id,
         platform=task.platform,
         resource_type=task.resource_type,
         record=record,
-        claim_task_id=task.task_id,
-        claim_task_type=task.task_type,
         metadata=dict(task.metadata),
+        claim_task_id=claim_task_id,
+        claim_task_type=claim_task_type,
     )
+
+
+def claimed_task_to_work_item(task: TaskEnvelope) -> WorkItem:
+    return task_to_work_item(task)
 
 
 def build_report_payload(item: WorkItem, record: dict[str, Any]) -> dict[str, Any]:
@@ -161,16 +197,39 @@ class ResumeQueueSource:
 class BackendClaimSource:
     def __init__(self, client: Any) -> None:
         self.client = client
+        self.last_errors: list[str] = []
 
     def collect(self) -> list[WorkItem]:
+        self.last_errors = []
         items: list[WorkItem] = []
-        repeat_payload = self.client.claim_repeat_crawl_task()
+        repeat_payload = self._safe_claim(self.client.claim_repeat_crawl_task, "repeat_crawl")
         if isinstance(repeat_payload, dict):
-            items.append(claimed_task_to_work_item(claimed_task_from_payload("repeat_crawl", repeat_payload, client=self.client)))
-        refresh_payload = self.client.claim_refresh_task()
+            item = self._safe_build_work_item("repeat_crawl", repeat_payload)
+            if item is not None:
+                items.append(item)
+        refresh_payload = self._safe_claim(self.client.claim_refresh_task, "refresh")
         if isinstance(refresh_payload, dict):
-            items.append(claimed_task_to_work_item(claimed_task_from_payload("refresh", refresh_payload, client=self.client)))
+            item = self._safe_build_work_item("refresh", refresh_payload)
+            if item is not None:
+                items.append(item)
         return items
+
+    def _safe_claim(self, claim_fn: Any, task_type: str) -> dict[str, Any] | None:
+        try:
+            payload = claim_fn()
+        except Exception as exc:
+            self.last_errors.append(f"claim source failed: {task_type} claim request failed: {exc}")
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _safe_build_work_item(self, task_type: str, payload: dict[str, Any]) -> WorkItem | None:
+        try:
+            task = claimed_task_from_payload(task_type, payload, client=self.client)
+            return claimed_task_to_work_item(task)
+        except Exception as exc:
+            task_id = optional_string(payload.get("id")) or "unknown"
+            self.last_errors.append(f"claim source failed: {task_type} task {task_id} skipped: {exc}")
+            return None
 
 
 class DatasetDiscoverySource:
