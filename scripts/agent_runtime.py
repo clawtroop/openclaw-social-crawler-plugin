@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from auth_orchestrator import AUTH_ERROR_CODES, AuthOrchestrator
 from common import inject_crawler_root, resolve_wallet_config
 from crawl_mode_planner import CrawlModePlanner
+from openclaw_enrich import resolve_openclaw_enrich_model_config, write_model_config
 from pow_solver import UnsupportedChallenge, solve_challenge
 from run_artifacts import RunArtifactWriter
 from run_models import CrawlerRunResult, WorkItem, WorkerConfig, WorkerIterationSummary
@@ -35,7 +36,10 @@ from worker_state import WorkerStateStore
 
 CRAWLER_ROOT = inject_crawler_root()
 
-from crawler.io import read_json_file, read_jsonl_file  # noqa: E402
+try:
+    from crawler.io import read_json_file, read_jsonl_file  # type: ignore[import-not-found]  # noqa: E402
+except ModuleNotFoundError:
+    from crawler.output import read_json_file, read_jsonl_file  # noqa: E402
 from crawler.submission_export import build_submission_request  # noqa: E402
 
 
@@ -178,6 +182,21 @@ class PlatformClient:
             except httpx.HTTPStatusError as error:
                 last_error = error
                 status_code = error.response.status_code
+                if status_code == 401:
+                    error_code = ""
+                    try:
+                        error_payload = error.response.json()
+                    except ValueError:
+                        error_payload = {}
+                    if isinstance(error_payload, dict):
+                        error_body = error_payload.get("error")
+                        if isinstance(error_body, dict):
+                            error_code = str(error_body.get("code") or "")
+                    if error_code == "MISSING_HEADERS":
+                        raise RuntimeError(
+                            "Platform Service requires Web3 signature headers; configure plugin config "
+                            "`awpWalletToken` (from `awp-wallet unlock --duration 3600`) or provide equivalent signed requests."
+                        ) from error
                 if status_code < 500 or attempt >= self._max_retries:
                     raise
                 time.sleep(0.5 * attempt)
@@ -198,6 +217,9 @@ class CrawlerRunner:
         input_path = output_dir / "task-input.jsonl"
         input_path.write_text(json.dumps(item.record, ensure_ascii=False) + "\n", encoding="utf-8")
         argv = [self.config.python_bin, "-m", "crawler", command, "--input", str(input_path), "--output", str(output_dir), "--auto-login"]
+        model_config_path = self._prepare_model_config_path(command=command, output_dir=output_dir)
+        if model_config_path is not None:
+            argv.extend(["--model-config", str(model_config_path)])
         if item.resume:
             argv.append("--resume")
         if command == "discover-crawl":
@@ -229,6 +251,13 @@ class CrawlerRunner:
             stderr=completed.stderr,
         )
 
+    def _prepare_model_config_path(self, *, command: str, output_dir: Path) -> Path | None:
+        if command not in {"run", "enrich"}:
+            return None
+        if not self.config.openclaw_enrich_enabled or not self.config.openclaw_model_config:
+            return None
+        return write_model_config(output_dir / "_runtime" / "openclaw-model-config.json", self.config.openclaw_model_config)
+
 
 def _solve_pow_challenge(challenge: dict[str, Any]) -> str:
     """Solve a PoW challenge.  Returns the answer string.
@@ -249,6 +278,8 @@ def _build_test_config(root: Path) -> WorkerConfig:
         crawler_root=CRAWLER_ROOT,
         python_bin="python",
         state_root=root / "state",
+        openclaw_enrich_enabled=False,
+        openclaw_model_config={},
     )
 
 
@@ -498,6 +529,7 @@ class AgentWorker:
                     item,
                     report_result=report_result,
                 )
+                self.state_store.clear_submit_pending(item.item_id)
                 summary.submitted_items += 1
                 summary.messages.append(f"processed {item.item_id} in {result.output_dir}; exported core submissions to {export_path}")
             except Exception as exc:
@@ -600,6 +632,7 @@ def build_worker_from_env() -> AgentWorker:
     output_root = Path(os.environ.get("CRAWLER_OUTPUT_ROOT", str(CRAWLER_ROOT / "output" / "agent-runs"))).resolve()
     python_bin = os.environ.get("PYTHON_BIN") or os.environ.get("PLUGIN_PYTHON_BIN") or "python"
     state_root = Path(os.environ.get("WORKER_STATE_ROOT", str(output_root / "_worker_state"))).resolve()
+    openclaw_model_config = resolve_openclaw_enrich_model_config()
     config = WorkerConfig(
         base_url=os.environ["PLATFORM_BASE_URL"],
         token=os.environ.get("PLATFORM_TOKEN", ""),
@@ -614,6 +647,8 @@ def build_worker_from_env() -> AgentWorker:
         discovery_max_pages=max(1, int(os.environ.get("DISCOVERY_MAX_PAGES", "25"))),
         discovery_max_depth=max(0, int(os.environ.get("DISCOVERY_MAX_DEPTH", "1"))),
         auth_retry_interval_seconds=max(30, int(os.environ.get("AUTH_RETRY_INTERVAL_SECONDS", "300"))),
+        openclaw_enrich_enabled=bool(openclaw_model_config),
+        openclaw_model_config=openclaw_model_config,
     )
 
     wallet_bin, wallet_token = resolve_wallet_config()

@@ -51,6 +51,15 @@ Optional:
 The plugin shells out to `scripts/run_tool.py`, which loads the `social-data-crawler`
 project from `crawlerRoot` and reuses its existing CLI / submission export code.
 
+When the local OpenClaw Gateway is already running, the plugin now auto-detects Gateway auth and injects a temporary crawler `--model-config` for `run` / `enrich` execution:
+
+- no manual provider key entry in the enrich flow
+- prefers `OPENCLAW_GATEWAY_TOKEN` when present
+- otherwise reads `~/.openclaw/openclaw.json` or `OPENCLAW_CONFIG_PATH`
+- supports OpenClaw `SecretRef` token sources: `env`, `file`, and `exec`
+
+This keeps OpenClaw-specific enrich wiring in the plugin layer instead of making `social-data-crawler` auto-switch providers by default.
+
 `social_crawler_worker` is now the primary entrypoint. It drives a single Worker state machine that can:
 
 - send unified + miner heartbeats
@@ -104,6 +113,13 @@ Additional worker-oriented config:
 - `discoveryMaxPages`
 - `discoveryMaxDepth`
 - `authRetryIntervalSeconds`
+
+Optional process env overrides for local Gateway enrich:
+
+- `OPENCLAW_ENRICH_MODE=off` to disable plugin-side auto injection
+- `OPENCLAW_GATEWAY_BASE_URL` to override `http://127.0.0.1:18789/v1`
+- `OPENCLAW_ENRICH_MODEL` to override `openclaw/default`
+- `OPENCLAW_UPSTREAM_MODEL` to send `x-openclaw-model` for upstream model selection
 
 ## Local verification
 
