@@ -33,6 +33,38 @@
       "defaultBackend": {
         "type": "string",
         "description": "Optional backend override passed to social-data-crawler."
+      },
+      "awpWalletBin": {
+        "type": "string",
+        "description": "Path to awp-wallet CLI executable. Defaults to 'awp-wallet'."
+      },
+      "awpWalletToken": {
+        "type": "string",
+        "description": "awp-wallet session token (from 'awp-wallet unlock --scope full'). Required for EIP-712 signed requests."
+      },
+      "workerStateRoot": {
+        "type": "string",
+        "description": "Directory for autonomous worker state such as backlog, auth pending, and submit pending."
+      },
+      "workerMaxParallel": {
+        "type": "number",
+        "description": "Maximum concurrent crawler work items handled by the autonomous worker."
+      },
+      "datasetRefreshSeconds": {
+        "type": "number",
+        "description": "Minimum seconds between autonomous dataset discovery scheduling."
+      },
+      "discoveryMaxPages": {
+        "type": "number",
+        "description": "Maximum pages per autonomous discover-crawl seed."
+      },
+      "discoveryMaxDepth": {
+        "type": "number",
+        "description": "Maximum depth per autonomous discover-crawl seed."
+      },
+      "authRetryIntervalSeconds": {
+        "type": "number",
+        "description": "Retry interval for auth-pending items after PUBLIC_URL/VNC login is required."
       }
     },
     "required": ["crawlerRoot", "platformBaseUrl", "minerId"]

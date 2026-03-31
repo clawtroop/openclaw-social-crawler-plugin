@@ -11,6 +11,14 @@ type PluginConfig = {
   minerId?: string;
   outputRoot?: string;
   defaultBackend?: string;
+  awpWalletBin?: string;
+  awpWalletToken?: string;
+  workerStateRoot?: string;
+  workerMaxParallel?: number;
+  datasetRefreshSeconds?: number;
+  discoveryMaxPages?: number;
+  discoveryMaxDepth?: number;
+  authRetryIntervalSeconds?: number;
 };
 
 function resolvePluginConfig(api: OpenClawPluginApi): Required<Pick<PluginConfig, "crawlerRoot" | "platformBaseUrl" | "minerId">> & PluginConfig {
@@ -48,6 +56,15 @@ async function runPythonTool(
     MINER_ID: cfg.minerId,
     CRAWLER_OUTPUT_ROOT: cfg.outputRoot ?? path.join(cfg.crawlerRoot, "output", "agent-runs"),
     DEFAULT_BACKEND: cfg.defaultBackend ?? "",
+    AWP_WALLET_BIN: cfg.awpWalletBin ?? "awp-wallet",
+    AWP_WALLET_TOKEN: cfg.awpWalletToken ?? "",
+    PLUGIN_PYTHON_BIN: pythonBin,
+    WORKER_STATE_ROOT: cfg.workerStateRoot ?? path.join(cfg.crawlerRoot, "output", "agent-runs", "_worker_state"),
+    WORKER_MAX_PARALLEL: String(cfg.workerMaxParallel ?? 3),
+    DATASET_REFRESH_SECONDS: String(cfg.datasetRefreshSeconds ?? 900),
+    DISCOVERY_MAX_PAGES: String(cfg.discoveryMaxPages ?? 25),
+    DISCOVERY_MAX_DEPTH: String(cfg.discoveryMaxDepth ?? 1),
+    AUTH_RETRY_INTERVAL_SECONDS: String(cfg.authRetryIntervalSeconds ?? 300),
   };
 
   return await new Promise((resolve, reject) => {
@@ -122,6 +139,56 @@ export function createProcessTaskFileTool(api: OpenClawPluginApi) {
         throw new Error("taskType and taskPath are required");
       }
       const text = await runPythonTool(api, "process-task-file", [taskType, taskPath]);
+      return { content: [{ type: "text", text }] };
+    },
+  };
+}
+
+export function createRunLoopTool(api: OpenClawPluginApi) {
+  return {
+    name: "social_crawler_run_loop",
+    label: "Social Crawler Run Loop",
+    description:
+      "Start continuous mining: heartbeat, claim tasks, crawl, and report in a loop. Stops on interrupt or max iterations.",
+    parameters: Type.Object({
+      interval: Type.Optional(
+        Type.Number({ description: "Seconds between iterations. Default 60.", default: 60 }),
+      ),
+      maxIterations: Type.Optional(
+        Type.Number({ description: "Stop after N iterations. 0 = infinite. Default 0.", default: 0 }),
+      ),
+    }),
+    async execute(_id: string, params: Record<string, unknown>) {
+      const interval =
+        typeof params.interval === "number" ? String(Math.max(10, params.interval)) : "60";
+      const maxIter =
+        typeof params.maxIterations === "number" ? String(params.maxIterations) : "0";
+      const text = await runPythonTool(api, "run-loop", [interval, maxIter]);
+      return { content: [{ type: "text", text }] };
+    },
+  };
+}
+
+export function createMainWorkerTool(api: OpenClawPluginApi) {
+  return {
+    name: "social_crawler_worker",
+    label: "Social Crawler Worker",
+    description:
+      "Run the single-entry autonomous worker: heartbeat, task discovery/claim, crawl orchestration, auth handling, report, submit, and resume.",
+    parameters: Type.Object({
+      interval: Type.Optional(
+        Type.Number({ description: "Seconds between iterations. Default 60.", default: 60 }),
+      ),
+      maxIterations: Type.Optional(
+        Type.Number({ description: "Stop after N iterations. 1 = single cycle, 0 = infinite. Default 1.", default: 1 }),
+      ),
+    }),
+    async execute(_id: string, params: Record<string, unknown>) {
+      const interval =
+        typeof params.interval === "number" ? String(Math.max(10, params.interval)) : "60";
+      const maxIter =
+        typeof params.maxIterations === "number" ? String(params.maxIterations) : "1";
+      const text = await runPythonTool(api, "run-worker", [interval, maxIter]);
       return { content: [{ type: "text", text }] };
     },
   };

@@ -15,7 +15,13 @@
           "platformToken": "",
           "minerId": "miner-001",
           "outputRoot": "D:/kaifa/clawtroop/social-data-crawler/output/agent-runs",
-          "defaultBackend": "http"
+          "defaultBackend": "http",
+          "workerStateRoot": "D:/kaifa/clawtroop/social-data-crawler/output/agent-runs/_worker_state",
+          "workerMaxParallel": 3,
+          "datasetRefreshSeconds": 900,
+          "discoveryMaxPages": 25,
+          "discoveryMaxDepth": 1,
+          "authRetryIntervalSeconds": 300
         }
       }
     }

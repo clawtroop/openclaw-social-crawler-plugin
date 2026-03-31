@@ -22,3 +22,17 @@ def inject_crawler_root() -> Path:
     if root_str not in sys.path:
         sys.path.insert(0, root_str)
     return root
+
+
+def resolve_wallet_config() -> tuple[str, str]:
+    """Return ``(wallet_bin, wallet_token)`` from environment variables.
+
+    * ``AWP_WALLET_BIN``   – path to awp-wallet CLI (default ``"awp-wallet"``)
+    * ``AWP_WALLET_TOKEN`` – session token from ``awp-wallet unlock --scope full``
+    """
+    import os
+
+    return (
+        os.environ.get("AWP_WALLET_BIN", "awp-wallet"),
+        os.environ.get("AWP_WALLET_TOKEN", ""),
+    )

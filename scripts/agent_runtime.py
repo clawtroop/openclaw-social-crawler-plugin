@@ -2,89 +2,52 @@ from __future__ import annotations
 
 import json
 import os
-import re
+import subprocess
 import time
-from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
-from urllib.parse import unquote, urlparse
+from typing import TYPE_CHECKING, Any
 
 import httpx
 
-from common import inject_crawler_root
+if TYPE_CHECKING:
+    from signer import WalletSigner
+
+from auth_orchestrator import AUTH_ERROR_CODES, AuthOrchestrator
+from common import inject_crawler_root, resolve_wallet_config
+from crawl_mode_planner import CrawlModePlanner
+from run_models import CrawlerRunResult, WorkItem, WorkerConfig, WorkerIterationSummary
+from task_sources import (
+    BackendClaimSource,
+    DatasetDiscoverySource,
+    ResumeQueueSource,
+    build_follow_up_items_from_discovery,
+    build_report_payload,
+    optional_string,
+)
+from worker_state import WorkerStateStore
 
 CRAWLER_ROOT = inject_crawler_root()
 
-from crawler.cli import main as crawler_main  # noqa: E402
 from crawler.io import read_json_file, read_jsonl_file  # noqa: E402
 from crawler.submission_export import build_submission_request  # noqa: E402
 
 
-@dataclass(frozen=True, slots=True)
-class ClaimedTask:
-    task_id: str
-    task_type: str
-    url: str
-    dataset_id: str | None
-    platform: str
-    resource_type: str
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-def claimed_task_from_payload(
-    task_type: str,
-    payload: dict[str, Any],
-    *,
-    client: "PlatformClient | None" = None,
-) -> ClaimedTask:
-    enriched_payload = _enrich_task_payload(task_type, payload, client=client)
-    task_id = str(payload.get("id") or "").strip()
-    if not task_id:
-        raise ValueError("task payload is missing id")
-    url = str(enriched_payload.get("url") or enriched_payload.get("target_url") or "").strip()
-    if not url:
-        raise ValueError(f"task {task_id} is missing url")
-    platform, resource_type, discovered_fields = _infer_platform_task(url)
-    metadata = dict(enriched_payload)
-    metadata.pop("id", None)
-    metadata.pop("url", None)
-    metadata.pop("target_url", None)
-    return ClaimedTask(
-        task_id=task_id,
-        task_type=task_type,
-        url=url,
-        dataset_id=_optional_string(enriched_payload.get("dataset_id")),
-        platform=_optional_string(enriched_payload.get("platform")) or platform,
-        resource_type=_optional_string(enriched_payload.get("resource_type")) or resource_type,
-        metadata=metadata,
-    )
-
-
-def claimed_task_to_crawl_record(task: ClaimedTask) -> dict[str, Any]:
-    record: dict[str, Any] = _build_platform_record(task)
-    for key, value in task.metadata.items():
-        if key not in {"dataset_id", "platform", "resource_type"} and value not in (None, ""):
-            record[key] = value
-    return record
-
-
-def build_report_payload(task: ClaimedTask, record: dict[str, Any]) -> dict[str, Any]:
-    cleaned_data = record.get("plain_text")
-    if cleaned_data in (None, ""):
-        cleaned_data = record.get("cleaned_data")
-    if cleaned_data in (None, ""):
-        cleaned_data = record.get("markdown")
-    return {
-        "cleaned_data": "" if cleaned_data is None else str(cleaned_data),
-        "canonical_url": record.get("canonical_url") or record.get("url") or task.url,
-        "structured_data": record.get("structured") if isinstance(record.get("structured"), dict) else {},
-        "crawl_timestamp": _optional_string(record.get("crawl_timestamp")),
-    }
+class SkipItemError(RuntimeError):
+    pass
 
 
 class PlatformClient:
-    def __init__(self, *, base_url: str, token: str, miner_id: str) -> None:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        token: str,
+        miner_id: str,
+        signer: "WalletSigner | None" = None,
+    ) -> None:
         self.miner_id = miner_id
+        self._signer = signer
         self._max_retries = 3
         headers = {
             "Content-Type": "application/json",
@@ -129,6 +92,45 @@ class PlatformClient:
             raise ValueError(f"unexpected dataset payload for {dataset_id}")
         return data
 
+    def list_datasets(self) -> list[dict[str, Any]]:
+        payload = self._request("GET", "/api/core/v1/datasets", None)
+        data = payload.get("data")
+        if isinstance(data, list):
+            return [item for item in data if isinstance(item, dict)]
+        if isinstance(data, dict):
+            items = data.get("items")
+            if isinstance(items, list):
+                return [item for item in items if isinstance(item, dict)]
+        return []
+
+    def send_unified_heartbeat(self, *, client_name: str, ip_address: str = "") -> dict[str, Any]:
+        return self._request("POST", "/api/mining/v1/heartbeat", {
+            "client": client_name,
+            "ip_address": ip_address,
+        })
+
+    def submit_preflight(self, dataset_id: str, epoch_id: str) -> dict[str, Any]:
+        return self._request("POST", "/api/mining/v1/miners/preflight", {
+            "dataset_id": dataset_id,
+            "epoch_id": epoch_id,
+        })
+
+    def answer_pow_challenge(self, challenge_id: str, answer: str) -> dict[str, Any]:
+        return self._request("POST", f"/api/mining/v1/pow-challenges/{challenge_id}/answer", {
+            "answer": answer,
+        })
+
+    def check_url_occupancy(self, dataset_id: str, url: str) -> dict[str, Any]:
+        from urllib.parse import quote
+        encoded_url = quote(url, safe="")
+        resp = self._request(
+            "GET",
+            f"/api/core/v1/url-occupancies/check?dataset_id={dataset_id}&url={encoded_url}",
+            None,
+        )
+        data = resp.get("data")
+        return data if isinstance(data, dict) else {}
+
     def _claim(self, path: str) -> dict[str, Any] | None:
         try:
             payload = self._request("POST", path, None)
@@ -144,9 +146,11 @@ class PlatformClient:
         return data
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None) -> dict[str, Any]:
-        kwargs = {}
+        kwargs: dict[str, Any] = {}
         if payload is not None:
             kwargs["json"] = payload
+        if self._signer is not None:
+            kwargs["headers"] = self._signer.build_auth_headers(method, path)
         last_error: Exception | None = None
         for attempt in range(1, self._max_retries + 1):
             try:
@@ -169,40 +173,58 @@ class PlatformClient:
         raise RuntimeError(f"request failed for {method} {path}")
 
 
-@dataclass(frozen=True, slots=True)
-class WorkerConfig:
-    base_url: str
-    token: str
-    miner_id: str
-    output_root: Path
-    default_backend: str | None = None
-    client_name: str = "social-crawler-agent/0.1"
-
-
 class CrawlerRunner:
-    def __init__(self, output_root: Path, *, default_backend: str | None = None) -> None:
-        self.output_root = output_root
-        self.default_backend = default_backend
+    def __init__(self, config: WorkerConfig) -> None:
+        self.config = config
+        self.output_root = config.output_root
+        self.default_backend = config.default_backend
 
-    def run_task(self, task: ClaimedTask) -> tuple[Path, dict[str, Any], dict[str, Any]]:
-        output_dir = self.output_root / task.task_type / task.task_id
+    def run_item(self, item: WorkItem, command: str) -> CrawlerRunResult:
+        output_dir = Path(item.output_dir) if item.output_dir else (self.output_root / item.source / _safe_path_segment(item.item_id))
         output_dir.mkdir(parents=True, exist_ok=True)
         input_path = output_dir / "task-input.jsonl"
-        input_path.write_text(json.dumps(claimed_task_to_crawl_record(task), ensure_ascii=False) + "\n", encoding="utf-8")
-        argv = ["crawl", "--input", str(input_path), "--output", str(output_dir)]
-        if self.default_backend:
+        input_path.write_text(json.dumps(item.record, ensure_ascii=False) + "\n", encoding="utf-8")
+        argv = [self.config.python_bin, "-m", "crawler", command, "--input", str(input_path), "--output", str(output_dir), "--auto-login"]
+        if item.resume:
+            argv.append("--resume")
+        if command == "discover-crawl":
+            argv.extend(["--max-depth", str(self.config.discovery_max_depth), "--max-pages", str(self.config.discovery_max_pages)])
+        elif self.default_backend:
             argv.extend(["--backend", self.default_backend])
-        exit_code = crawler_main(argv)
-        if exit_code != 0:
-            raise RuntimeError(f"crawler exited with code {exit_code} for task {task.task_id}")
-        records = read_jsonl_file(output_dir / "records.jsonl")
-        if not records:
-            raise RuntimeError(f"crawler produced no records for task {task.task_id}")
+        completed = subprocess.run(
+            argv,
+            cwd=self.config.crawler_root,
+            capture_output=True,
+            text=True,
+        )
+        records_path = output_dir / "records.jsonl"
+        errors_path = output_dir / "errors.jsonl"
+        records = read_jsonl_file(records_path) if records_path.exists() else []
+        errors = read_jsonl_file(errors_path) if errors_path.exists() else []
         summary_path = output_dir / "summary.json"
         summary = read_json_file(summary_path) if summary_path.exists() else {}
         if not isinstance(summary, dict):
             summary = {}
-        return output_dir, records[0], summary
+        return CrawlerRunResult(
+            output_dir=output_dir,
+            records=records,
+            errors=errors,
+            summary=summary,
+            exit_code=completed.returncode,
+            argv=argv,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+        )
+
+
+def _solve_pow_challenge(challenge: dict[str, Any]) -> str:
+    """Solve a PoW challenge.  Returns the answer string.
+
+    Placeholder implementation — returns the prompt directly.
+    The actual solving strategy depends on ``question_type`` values
+    the backend sends (LLM-answerable questions, hash puzzles, etc.).
+    """
+    return str(challenge.get("prompt", ""))
 
 
 class AgentWorker:
@@ -210,51 +232,306 @@ class AgentWorker:
         self.client = client
         self.runner = runner
         self.config = config
+        self.state_store = WorkerStateStore(config.state_root)
+        self.resume_source = ResumeQueueSource(self.state_store)
+        self.backend_source = BackendClaimSource(self.client)
+        self.dataset_source = DatasetDiscoverySource(self.client, self.state_store)
+        self.crawl_mode_planner = CrawlModePlanner()
+        self.auth_orchestrator = AuthOrchestrator(
+            self.state_store,
+            retry_after_seconds=config.auth_retry_interval_seconds,
+        )
 
     def run_once(self) -> str:
-        self.client.send_miner_heartbeat(client_name=self.config.client_name)
-
-        repeat_payload = self.client.claim_repeat_crawl_task()
-        if repeat_payload:
-            return self.process_task_payload("repeat_crawl", repeat_payload)
-
-        refresh_payload = self.client.claim_refresh_task()
-        if refresh_payload:
-            return self.process_task_payload("refresh", refresh_payload)
-
+        summary = self.run_iteration(1)
+        if summary["messages"]:
+            return "; ".join(summary["messages"])
+        if summary["auth_pending"]:
+            first = summary["auth_pending"][0]
+            return json.dumps(first, ensure_ascii=False)
         return "no task available"
 
     def process_task_payload(self, task_type: str, payload: dict[str, Any]) -> str:
-        task = claimed_task_from_payload(task_type, payload, client=self.client)
-        output_dir, record, _summary = self.runner.run_task(task)
-        report_payload = build_report_payload(task, record)
-        if task.task_type == "repeat_crawl":
-            report_result = self.client.report_repeat_crawl_task_result(task.task_id, report_payload)
-        elif task.task_type == "refresh":
-            report_result = self.client.report_refresh_task_result(task.task_id, report_payload)
+        from task_sources import claimed_task_from_payload, claimed_task_to_work_item
+
+        item = claimed_task_to_work_item(claimed_task_from_payload(task_type, payload, client=self.client))
+        summary = WorkerIterationSummary(iteration=1)
+        self._process_items([item], summary)
+        result = summary.to_dict()
+        if result["messages"]:
+            return "; ".join(result["messages"])
+        if result["errors"]:
+            return "; ".join(result["errors"])
+        return json.dumps(result, ensure_ascii=False)
+
+    def run_iteration(self, iteration: int) -> dict[str, Any]:
+        summary = WorkerIterationSummary(iteration=iteration)
+        self._send_heartbeats(summary)
+        self._drain_submit_pending(summary)
+        work_items = self._collect_work_items(summary)
+        if not work_items:
+            summary.messages.append("no task available")
+            summary.retry_pending = len(self.state_store.load_backlog()) + len(self.state_store.load_auth_pending())
+            return summary.to_dict()
+        self._process_items(work_items, summary)
+        summary.retry_pending = len(self.state_store.load_backlog()) + len(self.state_store.load_auth_pending())
+        return summary.to_dict()
+
+    def run_loop(self, *, interval: int = 60, max_iterations: int = 0) -> str:
+        """Run continuous mining loop.
+
+        Args:
+            interval: Seconds between iterations (default 60)
+            max_iterations: Stop after N iterations, 0 = infinite
+        """
+        iteration = 0
+        consecutive_empty = 0
+        while max_iterations == 0 or iteration < max_iterations:
+            iteration += 1
+            try:
+                summary = self.run_iteration(iteration)
+                result = json.dumps(summary, ensure_ascii=False)
+                if not summary["processed_items"] and not summary["discovery_items"] and not summary["claimed_items"] and not summary["resumed_items"]:
+                    consecutive_empty += 1
+                    wait = min(interval * (2 ** min(consecutive_empty, 3)), 300)
+                else:
+                    consecutive_empty = 0
+                    wait = interval
+                print(f"[worker] iteration {iteration}: {result}")
+            except KeyboardInterrupt:
+                print(f"[worker] stopped after {iteration} iterations")
+                return f"stopped after {iteration} iterations"
+            except Exception as e:
+                print(f"[worker] iteration {iteration} error: {e}")
+                wait = min(interval * 2, 120)
+
+            try:
+                time.sleep(wait)
+            except KeyboardInterrupt:
+                print(f"[worker] stopped after {iteration} iterations")
+                return f"stopped after {iteration} iterations"
+
+        return f"completed {iteration} iterations"
+
+    def run_worker(self, *, interval: int = 60, max_iterations: int = 1) -> dict[str, Any]:
+        iterations: list[dict[str, Any]] = []
+        iteration = 0
+        while max_iterations == 0 or iteration < max_iterations:
+            iteration += 1
+            iterations.append(self.run_iteration(iteration))
+            if max_iterations == 1:
+                break
+            time.sleep(interval)
+        return {
+            "completed_iterations": iteration,
+            "iterations": iterations,
+            "state": {
+                "backlog": len(self.state_store.load_backlog()),
+                "auth_pending": self.state_store.load_auth_pending(),
+                "submit_pending": len(self.state_store.load_submit_pending()),
+            },
+        }
+
+    def _send_heartbeats(self, summary: WorkerIterationSummary) -> None:
+        try:
+            self.client.send_unified_heartbeat(client_name=self.config.client_name)
+            summary.unified_heartbeat_sent = True
+        except Exception as exc:
+            summary.errors.append(f"unified heartbeat failed: {exc}")
+        try:
+            self.client.send_miner_heartbeat(client_name=self.config.client_name)
+            summary.heartbeat_sent = True
+        except Exception as exc:
+            summary.errors.append(f"miner heartbeat failed: {exc}")
+
+    def _collect_work_items(self, summary: WorkerIterationSummary) -> list[WorkItem]:
+        items: list[WorkItem] = []
+        resumed = self.resume_source.collect(limit=self.config.max_parallel)
+        summary.resumed_items = len(resumed)
+        items.extend(resumed)
+        claimed = self.backend_source.collect()
+        summary.claimed_items = len(claimed)
+        items.extend(claimed)
+        discoveries = self.dataset_source.collect(min_interval_seconds=self.config.dataset_refresh_seconds)
+        summary.discovery_items = len(discoveries)
+        items.extend(discoveries)
+        merged: dict[str, WorkItem] = {}
+        for item in items:
+            merged[item.item_id] = item
+        return list(merged.values())[: self.config.max_parallel]
+
+    def _process_items(self, items: list[WorkItem], summary: WorkerIterationSummary) -> None:
+        with ThreadPoolExecutor(max_workers=max(1, self.config.max_parallel)) as executor:
+            futures = {executor.submit(self._run_item, item): item for item in items}
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    result = future.result()
+                except SkipItemError as exc:
+                    summary.skipped_items += 1
+                    summary.messages.append(f"skipped {item.item_id}: {exc}")
+                    continue
+                except Exception as exc:
+                    summary.errors.append(f"{item.item_id}: {exc}")
+                    retryable_item = _clone_item(item, resume=True)
+                    self.state_store.enqueue_backlog([retryable_item])
+                    continue
+                self._handle_result(item, result, summary)
+
+    def _run_item(self, item: WorkItem) -> CrawlerRunResult:
+        command = self.crawl_mode_planner.choose_command(item)
+        self._preflight_item(item, command=command)
+        return self.runner.run_item(item, command)
+
+    def _preflight_item(self, item: WorkItem, *, command: str) -> None:
+        if item.dataset_id and command != "discover-crawl":
+            try:
+                occupancy = self.client.check_url_occupancy(item.dataset_id, item.url)
+                if occupancy.get("occupied"):
+                    raise SkipItemError(f"URL already occupied for {item.url}")
+            except SkipItemError:
+                raise
+            except Exception:
+                pass
+
+        epoch_id = optional_string(item.metadata.get("epoch_id"))
+        if item.dataset_id and epoch_id:
+            try:
+                preflight = self.client.submit_preflight(item.dataset_id, epoch_id)
+                preflight_data = preflight.get("data", {})
+                if isinstance(preflight_data, dict) and not preflight_data.get("allowed", True):
+                    reason = preflight_data.get("reason", "unknown")
+                    raise SkipItemError(f"preflight rejected: {reason}")
+                challenge = preflight_data.get("challenge") if isinstance(preflight_data, dict) else None
+                if isinstance(challenge, dict) and challenge:
+                    answer = _solve_pow_challenge(challenge)
+                    challenge_id = optional_string(challenge.get("id")) or optional_string(preflight_data.get("challenge_id")) or ""
+                    if challenge_id and answer:
+                        pow_result = self.client.answer_pow_challenge(challenge_id, answer)
+                        pow_data = pow_result.get("data", {})
+                        if isinstance(pow_data, dict) and not pow_data.get("passed"):
+                            raise SkipItemError(f"PoW challenge failed for {item.item_id}")
+            except SkipItemError:
+                raise
+            except Exception:
+                pass
+
+    def _handle_result(self, item: WorkItem, result: CrawlerRunResult, summary: WorkerIterationSummary) -> None:
+        auth_pending = self.auth_orchestrator.handle_errors(item, result.errors)
+        if auth_pending:
+            summary.auth_pending.extend(auth_pending)
+
+        retryable_errors = [
+            error for error in result.errors
+            if bool(error.get("retryable")) and str(error.get("error_code") or "") not in AUTH_ERROR_CODES
+        ]
+        if retryable_errors:
+            self.state_store.enqueue_backlog([_clone_item(item, resume=True, output_dir=result.output_dir)])
+
+        command = self.crawl_mode_planner.choose_command(item)
+        if command == "discover-crawl":
+            followups = build_follow_up_items_from_discovery(item, result.records)
+            if followups:
+                self.state_store.enqueue_backlog(followups)
+            summary.discovered_followups += len(followups)
+            summary.processed_items += 1
+            summary.messages.append(f"discovered {len(followups)} follow-up URLs from {item.url}")
+            return
+
+        if not result.records:
+            for error in result.errors:
+                summary.errors.append(f"{item.item_id}: {error.get('error_code') or 'UNKNOWN'}")
+            return
+
+        record = result.records[0]
+        self.auth_orchestrator.clear_if_recovered(item)
+        summary.processed_items += 1
+
+        report_result: dict[str, Any] | None = None
+        if item.claim_task_id and item.claim_task_type:
+            report_payload = build_report_payload(item, record)
+            if item.claim_task_type == "repeat_crawl":
+                report_result = self.client.report_repeat_crawl_task_result(item.claim_task_id, report_payload)
+            elif item.claim_task_type == "refresh":
+                report_result = self.client.report_refresh_task_result(item.claim_task_id, report_payload)
+
+        if item.dataset_id:
+            try:
+                export_path, _response_path = _export_and_submit_core_submissions_for_task(
+                    self.client,
+                    result.output_dir,
+                    record,
+                    item,
+                    report_result=report_result,
+                )
+                summary.submitted_items += 1
+                summary.messages.append(f"processed {item.item_id} in {result.output_dir}; exported core submissions to {export_path}")
+            except Exception as exc:
+                self.state_store.enqueue_submit_pending(item, {"record": record, "report_result": report_result})
+                summary.errors.append(f"submit deferred for {item.item_id}: {exc}")
         else:
-            raise ValueError(f"unsupported task type {task.task_type}")
-        export_path, _response_path = _export_and_submit_core_submissions_for_task(
-            self.client,
-            output_dir,
-            record,
-            task,
-            report_result=report_result if isinstance(report_result, dict) else None,
-        )
-        return f"processed {task.task_type} task {task.task_id} in {output_dir}; exported core submissions to {export_path}"
+            summary.messages.append(f"processed {item.item_id} in {result.output_dir}")
+
+    def _drain_submit_pending(self, summary: WorkerIterationSummary) -> None:
+        for entry in self.state_store.load_submit_pending():
+            item_payload = entry.get("item")
+            payload = entry.get("payload")
+            if not isinstance(item_payload, dict) or not isinstance(payload, dict):
+                continue
+            item = WorkItem.from_dict(item_payload)
+            record = payload.get("record")
+            report_result = payload.get("report_result")
+            if not isinstance(record, dict):
+                continue
+            output_dir = Path(item.output_dir) if item.output_dir else (self.runner.output_root / item.source / _safe_path_segment(item.item_id))
+            try:
+                _export_and_submit_core_submissions_for_task(
+                    self.client,
+                    output_dir,
+                    record,
+                    item,
+                    report_result=report_result if isinstance(report_result, dict) else None,
+                )
+            except Exception:
+                continue
+            self.state_store.clear_submit_pending(item.item_id)
+            summary.submitted_items += 1
 
 
 def build_worker_from_env() -> AgentWorker:
+    from signer import WalletSigner
+
     output_root = Path(os.environ.get("CRAWLER_OUTPUT_ROOT", str(CRAWLER_ROOT / "output" / "agent-runs"))).resolve()
+    python_bin = os.environ.get("PYTHON_BIN") or os.environ.get("PLUGIN_PYTHON_BIN") or "python"
+    state_root = Path(os.environ.get("WORKER_STATE_ROOT", str(output_root / "_worker_state"))).resolve()
     config = WorkerConfig(
         base_url=os.environ["PLATFORM_BASE_URL"],
         token=os.environ.get("PLATFORM_TOKEN", ""),
         miner_id=os.environ["MINER_ID"],
         output_root=output_root,
+        crawler_root=CRAWLER_ROOT,
+        python_bin=python_bin,
+        state_root=state_root,
         default_backend=(os.environ.get("DEFAULT_BACKEND") or None),
+        max_parallel=max(1, int(os.environ.get("WORKER_MAX_PARALLEL", "3"))),
+        dataset_refresh_seconds=max(60, int(os.environ.get("DATASET_REFRESH_SECONDS", "900"))),
+        discovery_max_pages=max(1, int(os.environ.get("DISCOVERY_MAX_PAGES", "25"))),
+        discovery_max_depth=max(0, int(os.environ.get("DISCOVERY_MAX_DEPTH", "1"))),
+        auth_retry_interval_seconds=max(30, int(os.environ.get("AUTH_RETRY_INTERVAL_SECONDS", "300"))),
     )
-    client = PlatformClient(base_url=config.base_url, token=config.token, miner_id=config.miner_id)
-    runner = CrawlerRunner(output_root=config.output_root, default_backend=config.default_backend)
+
+    wallet_bin, wallet_token = resolve_wallet_config()
+    signer: WalletSigner | None = None
+    if wallet_token.strip():
+        signer = WalletSigner(wallet_bin=wallet_bin, session_token=wallet_token)
+
+    client = PlatformClient(
+        base_url=config.base_url,
+        token=config.token,
+        miner_id=config.miner_id,
+        signer=signer,
+    )
+    runner = CrawlerRunner(config)
     return AgentWorker(client=client, runner=runner, config=config)
 
 
@@ -266,7 +543,7 @@ def export_core_submissions(input_path: str, output_path: str, dataset_id: str) 
     if manifest_path.exists():
         manifest = read_json_file(manifest_path)
         if isinstance(manifest, dict):
-            generated_at = _optional_string(manifest.get("generated_at"))
+            generated_at = optional_string(manifest.get("generated_at"))
     payload = build_submission_request(records, dataset_id=dataset_id, generated_at=generated_at)
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -274,97 +551,17 @@ def export_core_submissions(input_path: str, output_path: str, dataset_id: str) 
     return output
 
 
-def _optional_string(value: Any) -> str | None:
-    if value in (None, ""):
-        return None
-    return str(value)
-
-
-def _enrich_task_payload(
-    task_type: str,
-    payload: dict[str, Any],
-    *,
-    client: PlatformClient | None,
-) -> dict[str, Any]:
-    enriched = dict(payload)
-    if enriched.get("url") or enriched.get("target_url"):
-        return enriched
-    submission_id = _optional_string(enriched.get("submission_id"))
-    if task_type == "repeat_crawl" and submission_id and client is not None:
-        submission = client.fetch_core_submission(submission_id)
-        enriched.setdefault("dataset_id", submission.get("dataset_id"))
-        enriched.setdefault("url", submission.get("original_url") or submission.get("normalized_url"))
-    return enriched
-
-
-def _infer_platform_task(url: str) -> tuple[str, str, dict[str, str]]:
-    parsed = urlparse(url)
-    host = parsed.netloc.lower()
-    path = parsed.path
-
-    if host.endswith("en.wikipedia.org") and path.startswith("/wiki/"):
-        title = unquote(path.split("/wiki/", 1)[1]).replace("_", " ")
-        return "wikipedia", "article", {"title": title}
-
-    if host.endswith("arxiv.org") and path.startswith("/abs/"):
-        arxiv_id = path.split("/abs/", 1)[1].strip("/")
-        return "arxiv", "paper", {"arxiv_id": arxiv_id}
-
-    if host.endswith("www.linkedin.com"):
-        linkedin_patterns = (
-            (r"^/in/([^/]+)/?$", "profile", "public_identifier"),
-            (r"^/company/([^/]+)/?$", "company", "company_slug"),
-            (r"^/jobs/view/(\d+)/?$", "job", "job_id"),
-            (r"^/feed/update/([^/]+)/?$", "post", "activity_urn"),
-        )
-        for pattern, resource_type, field_name in linkedin_patterns:
-            match = re.match(pattern, path)
-            if match:
-                return "linkedin", resource_type, {field_name: match.group(1)}
-
-    if host.endswith("www.amazon.com"):
-        dp_match = re.search(r"/dp/([A-Z0-9]{10})(?:/|$)", path)
-        if dp_match:
-            return "amazon", "product", {"asin": dp_match.group(1)}
-
-    if host.endswith("basescan.org") or host.endswith("base.org"):
-        for prefix, resource_type, field_name in (
-            ("/address/", "address", "address"),
-            ("/tx/", "transaction", "tx_hash"),
-            ("/token/", "token", "contract_address"),
-        ):
-            if path.startswith(prefix):
-                return "base", resource_type, {field_name: path.split(prefix, 1)[1].strip("/")}
-
-    return "generic", "page", {"url": url}
-
-
-def _build_platform_record(task: ClaimedTask) -> dict[str, Any]:
-    platform, resource_type, discovered_fields = _infer_platform_task(task.url)
-    platform = task.platform or platform
-    resource_type = task.resource_type or resource_type
-    record: dict[str, Any] = {
-        "platform": platform,
-        "resource_type": resource_type,
-    }
-    if platform == "generic":
-        record["url"] = task.url
-    else:
-        record.update(discovered_fields)
-    return record
-
-
-def _export_core_submissions_for_task(output_dir: Path, record: dict[str, Any], task: ClaimedTask) -> Path:
-    dataset_id = _optional_string(task.dataset_id)
+def _export_core_submissions_for_task(output_dir: Path, record: dict[str, Any], item: WorkItem) -> Path:
+    dataset_id = optional_string(item.dataset_id)
     if not dataset_id:
-        raise RuntimeError(f"task {task.task_id} is missing dataset_id for core submission export")
+        raise RuntimeError(f"item {item.item_id} is missing dataset_id for core submission export")
     export_path = output_dir / "core-submissions.json"
     generated_at = None
     manifest_path = output_dir / "run_manifest.json"
     if manifest_path.exists():
         manifest = read_json_file(manifest_path)
         if isinstance(manifest, dict):
-            generated_at = _optional_string(manifest.get("generated_at"))
+            generated_at = optional_string(manifest.get("generated_at"))
     payload = build_submission_request([record], dataset_id=dataset_id, generated_at=generated_at)
     export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return export_path
@@ -374,19 +571,19 @@ def _export_and_submit_core_submissions_for_task(
     client: PlatformClient,
     output_dir: Path,
     record: dict[str, Any],
-    task: ClaimedTask,
+    item: WorkItem,
     *,
     report_result: dict[str, Any] | None = None,
 ) -> tuple[Path, Path]:
-    export_path = _export_core_submissions_for_task(output_dir, record, task)
+    export_path = _export_core_submissions_for_task(output_dir, record, item)
     payload = read_json_file(export_path)
     if not isinstance(payload, dict):
         raise RuntimeError(f"invalid core submission export payload at {export_path}")
-    dataset_id = _optional_string(task.dataset_id)
+    dataset_id = optional_string(item.dataset_id)
     fetch_dataset = getattr(client, "fetch_dataset", None)
     if dataset_id and callable(fetch_dataset):
         dataset = fetch_dataset(dataset_id)
-        _augment_submission_payload_for_dataset(payload, dataset=dataset, record=record, task=task)
+        _augment_submission_payload_for_dataset(payload, dataset=dataset, record=record, item=item)
         export_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     response_path = output_dir / "core-submissions-response.json"
     submission_id = _extract_submission_id(report_result)
@@ -404,7 +601,7 @@ def _augment_submission_payload_for_dataset(
     *,
     dataset: dict[str, Any],
     record: dict[str, Any],
-    task: ClaimedTask,
+    item: WorkItem,
 ) -> None:
     schema = dataset.get("schema")
     entries = payload.get("entries")
@@ -427,7 +624,7 @@ def _augment_submission_payload_for_dataset(
                 field_name,
                 entry=entry,
                 record=record,
-                task=task,
+                item=item,
                 structured_data=original_structured_data,
             )
             if value not in (None, ""):
@@ -440,18 +637,18 @@ def _resolve_schema_field_value(
     *,
     entry: dict[str, Any],
     record: dict[str, Any],
-    task: ClaimedTask,
+    item: WorkItem,
     structured_data: dict[str, Any],
 ) -> Any:
     record_metadata = record.get("metadata")
     metadata = record_metadata if isinstance(record_metadata, dict) else {}
     cleaned_data = entry.get("cleaned_data") or record.get("plain_text") or record.get("cleaned_data") or record.get("markdown")
     candidate_values = {
-        "url": entry.get("url") or record.get("canonical_url") or record.get("url") or task.url,
+        "url": entry.get("url") or record.get("canonical_url") or record.get("url") or item.url,
         "title": structured_data.get("title") or record.get("title") or metadata.get("title") or metadata.get("page_title"),
         "content": structured_data.get("content") or cleaned_data,
         "cleaned_data": cleaned_data,
-        "canonical_url": record.get("canonical_url") or task.url,
+        "canonical_url": record.get("canonical_url") or item.url,
     }
     if field_name in candidate_values:
         return candidate_values[field_name]
@@ -467,8 +664,8 @@ def _extract_submission_id(report_result: dict[str, Any] | None) -> str | None:
         return None
     data = report_result.get("data")
     if isinstance(data, dict):
-        return _optional_string(data.get("submission_id"))
-    return _optional_string(report_result.get("submission_id"))
+        return optional_string(data.get("submission_id"))
+    return optional_string(report_result.get("submission_id"))
 
 
 def _resolve_existing_submission_response(
@@ -489,3 +686,16 @@ def _resolve_existing_submission_response(
     if isinstance(report_result, dict):
         return report_result
     return {"data": [{"id": submission_id}]}
+
+
+def _safe_path_segment(value: str) -> str:
+    slug = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in value)
+    return slug or "item"
+
+
+def _clone_item(item: WorkItem, *, resume: bool, output_dir: Path | None = None) -> WorkItem:
+    payload = item.to_dict()
+    payload["resume"] = resume
+    if output_dir is not None:
+        payload["output_dir"] = str(output_dir)
+    return WorkItem.from_dict(payload)

@@ -39,8 +39,10 @@ Optional:
 
 ## Registered tools
 
+- `social_crawler_worker`
 - `social_crawler_heartbeat`
 - `social_crawler_run_once`
+- `social_crawler_run_loop`
 - `social_crawler_process_task_file`
 - `social_crawler_export_core_submissions`
 
@@ -49,7 +51,18 @@ Optional:
 The plugin shells out to `scripts/run_tool.py`, which loads the `social-data-crawler`
 project from `crawlerRoot` and reuses its existing CLI / submission export code.
 
-`run-once` now performs the full local integration chain:
+`social_crawler_worker` is now the primary entrypoint. It drives a single Worker state machine that can:
+
+- send unified + miner heartbeats
+- resume backlog / auth-pending / submit-pending work
+- claim repeat-crawl and refresh tasks
+- discover autonomous dataset seeds from active datasets
+- choose `discover-crawl`, `run`, or `crawl`
+- pass `--auto-login` through to `social-data-crawler`
+- keep other items running while auth-required items move into pending/retry state
+- export and submit Core payloads
+
+`run-once` remains as a compatibility/debug entry and still performs the local integration chain:
 
 - send mining heartbeat
 - claim one repeat-crawl or refresh task
@@ -58,6 +71,14 @@ project from `crawlerRoot` and reuses its existing CLI / submission export code.
 - export Core submission payload to `core-submissions.json`
 - if `report` already returns `submission_id`, treat that as the authoritative Core creation path and persist the lookup/result to `core-submissions-response.json`
 - otherwise submit the exported payload to `/api/core/v1/submissions`
+
+`run-loop` and `social_crawler_worker` build on top of the same worker pipeline and keep repeating:
+
+- heartbeat
+- claim one task if available
+- crawl / report / submit
+- sleep for the configured interval
+- continue until interrupted or `maxIterations` is reached
 
 Before exporting/submitting, the plugin now normalizes `structured_data` against the target dataset schema:
 
@@ -75,9 +96,19 @@ See [`openclaw.config.example.jsonc`](./openclaw.config.example.jsonc) for a min
 
 The important point is that OpenClaw config points at this plugin directory, while the plugin config points at the separate `social-data-crawler` project through `crawlerRoot`.
 
+Additional worker-oriented config:
+
+- `workerStateRoot`
+- `workerMaxParallel`
+- `datasetRefreshSeconds`
+- `discoveryMaxPages`
+- `discoveryMaxDepth`
+- `authRetryIntervalSeconds`
+
 ## Local verification
 
 ```bash
-python -m pytest tests/test_agent_runtime.py tests/test_run_tool.py -v
 python scripts/run_tool.py --help
+python scripts/run_tool.py run-worker 60 1
+python scripts/run_tool.py run-loop 60 1
 ```

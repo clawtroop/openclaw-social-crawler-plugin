@@ -9,7 +9,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="openclaw-social-crawler-plugin")
     parser.add_argument(
         "command",
-        choices=("heartbeat", "run-once", "process-task-file", "export-core-submissions"),
+        choices=("heartbeat", "run-once", "run-loop", "run-worker", "process-task-file", "export-core-submissions"),
     )
     parser.add_argument("args", nargs="*")
     return parser
@@ -28,6 +28,18 @@ def main() -> int:
 
     if namespace.command == "run-once":
         print(worker.run_once())
+        return 0
+
+    if namespace.command == "run-loop":
+        interval = int(namespace.args[0]) if namespace.args else 60
+        max_iter = int(namespace.args[1]) if len(namespace.args) > 1 else 0
+        print(worker.run_loop(interval=interval, max_iterations=max_iter))
+        return 0
+
+    if namespace.command == "run-worker":
+        interval = int(namespace.args[0]) if namespace.args else 60
+        max_iter = int(namespace.args[1]) if len(namespace.args) > 1 else 1
+        print(json.dumps(worker.run_worker(interval=interval, max_iterations=max_iter), ensure_ascii=False, indent=2))
         return 0
 
     if namespace.command == "process-task-file":
