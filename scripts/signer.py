@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import secrets
 import subprocess
 import time
@@ -82,7 +83,10 @@ class WalletSigner:
 
     def _run(self, *args: str) -> dict[str, Any]:
         cmd = [self._bin, *args]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        env = os.environ.copy()
+        if not env.get("HOME") and env.get("USERPROFILE"):
+            env["HOME"] = env["USERPROFILE"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
         if result.returncode != 0:
             raise RuntimeError(f"awp-wallet failed (exit {result.returncode}): {result.stderr.strip()}")
         return json.loads(result.stdout)

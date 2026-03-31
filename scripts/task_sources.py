@@ -50,7 +50,13 @@ def enrich_task_payload(task_type: str, payload: dict[str, Any], *, client: Any 
         return enriched
     submission_id = optional_string(enriched.get("submission_id"))
     if task_type == "repeat_crawl" and submission_id and client is not None:
-        submission = client.fetch_core_submission(submission_id)
+        try:
+            submission = client.fetch_core_submission(submission_id)
+        except Exception as exc:
+            raise ValueError(
+                f"repeat_crawl task references submission {submission_id}, "
+                "but the submission could not be loaded and the task payload does not include a url"
+            ) from exc
         enriched.setdefault("dataset_id", submission.get("dataset_id"))
         enriched.setdefault("url", submission.get("original_url") or submission.get("normalized_url"))
     return enriched
@@ -244,7 +250,7 @@ class DatasetDiscoverySource:
             if not dataset_id or not self.state_store.should_schedule_dataset(dataset_id, min_interval_seconds=min_interval_seconds):
                 continue
             for domain in _dataset_domains(dataset):
-                seed_url = domain if "://" in domain else f"https://{domain.strip('/')}/"
+                seed_url = _discovery_seed_url(domain)
                 platform, resource_type, _ = infer_platform_task(seed_url)
                 items.append(
                     WorkItem(
@@ -298,3 +304,14 @@ def _dataset_domains(dataset: dict[str, Any]) -> list[str]:
     if isinstance(domains, str):
         return [chunk.strip() for chunk in domains.split(",") if chunk.strip()]
     return []
+
+
+def _discovery_seed_url(domain: str) -> str:
+    raw = domain.strip()
+    seed_url = raw if "://" in raw else f"https://{raw.strip('/')}/"
+    parsed = urlparse(seed_url)
+    host = (parsed.netloc or parsed.path).lower()
+    normalized_path = parsed.path.rstrip("/")
+    if host.endswith(".wikipedia.org") and normalized_path in {"", "/"}:
+        return f"{parsed.scheme or 'https'}://{host}/wiki/Main_Page"
+    return seed_url
